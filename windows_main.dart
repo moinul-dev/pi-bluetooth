@@ -1,7 +1,10 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:nearby_connections/nearby_connections.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -44,9 +47,9 @@ class _HomeScreenState extends State<HomeScreen>
   String userStatus = "Available on π-Mesh";
   int avatarIndex = 0;
 
-  // endpointId -> "name|status|avatarIndex"
   Map<String, String> discoveredDevices = {};
   Map<String, String> connectedDevices = {};
+  final Map<int, String> _tempFilePaths = {};
   bool isScanning = false;
 
   late AnimationController _radarController;
@@ -125,6 +128,8 @@ class _HomeScreenState extends State<HomeScreen>
       Permission.bluetoothScan,
       Permission.location,
       Permission.nearbyWifiDevices,
+      Permission.photos,
+      Permission.storage,
     ].request();
   }
 
@@ -184,7 +189,22 @@ class _HomeScreenState extends State<HomeScreen>
       onPayLoadRecieved: (endpointId, payload) {
         if (payload.type == PayloadType.BYTES) {
           String message = utf8.decode(payload.bytes!);
-          ChatStorage.addMessage(endpointId, message, false);
+          ChatStorage.addMessage(endpointId, text: message, isMe: false);
+        } else if (payload.type == PayloadType.FILE) {
+          if (payload.uri != null) {
+            _tempFilePaths[payload.id] = payload.uri!;
+          }
+        }
+      },
+      onPayloadTransferUpdate: (endpointId, update) async {
+        if (update.status == PayloadStatus.SUCCESS &&
+            _tempFilePaths.containsKey(update.id)) {
+          String tempUri = _tempFilePaths.remove(update.id)!;
+          final dir = await getApplicationDocumentsDirectory();
+          final savedPath =
+              "${dir.path}/pi_img_${DateTime.now().millisecondsSinceEpoch}.jpg";
+          await Nearby().copyFileAndDeleteOriginal(tempUri, savedPath);
+          ChatStorage.addMessage(endpointId, imagePath: savedPath, isMe: false);
         }
       },
     );
@@ -411,7 +431,6 @@ class _HomeScreenState extends State<HomeScreen>
       ),
       body: Column(
         children: [
-          // Top Radar & Profile Card
           Container(
             width: double.infinity,
             padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
@@ -453,7 +472,6 @@ class _HomeScreenState extends State<HomeScreen>
               ],
             ),
           ),
-
           const Padding(
             padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
             child: Row(
@@ -470,7 +488,6 @@ class _HomeScreenState extends State<HomeScreen>
               ],
             ),
           ),
-
           Expanded(
             child: discoveredDevices.isEmpty
                 ? const Center(
@@ -592,10 +609,11 @@ class _HomeScreenState extends State<HomeScreen>
 }
 
 class ChatMessage {
-  final String text;
+  final String? text;
+  final String? imagePath;
   final bool isMe;
   final String time;
-  ChatMessage({required this.text, required this.isMe, required this.time});
+  ChatMessage({this.text, this.imagePath, required this.isMe, required this.time});
 }
 
 class ChatStorage {
@@ -606,11 +624,13 @@ class ChatStorage {
     return _chats[endpointId] ?? [];
   }
 
-  static void addMessage(String endpointId, String text, bool isMe) {
+  static void addMessage(String endpointId,
+      {String? text, String? imagePath, required bool isMe}) {
     _chats.putIfAbsent(endpointId, () => []);
     final now = TimeOfDay.now();
     final timeStr = "${now.hour}:${now.minute.toString().padLeft(2, '0')}";
-    _chats[endpointId]!.add(ChatMessage(text: text, isMe: isMe, time: timeStr));
+    _chats[endpointId]!.add(ChatMessage(
+        text: text, imagePath: imagePath, isMe: isMe, time: timeStr));
     updateNotifier.value++;
   }
 }
@@ -637,6 +657,7 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _msgController = TextEditingController();
+  final ImagePicker _picker = ImagePicker();
 
   void _sendMessage() {
     String text = _msgController.text.trim();
@@ -644,8 +665,20 @@ class _ChatScreenState extends State<ChatScreen> {
 
     Nearby().sendBytesPayload(
         widget.endpointId, Uint8List.fromList(utf8.encode(text)));
-    ChatStorage.addMessage(widget.endpointId, text, true);
+    ChatStorage.addMessage(widget.endpointId, text: text, isMe: true);
     _msgController.clear();
+  }
+
+  Future<void> _pickAndSendImage() async {
+    final XFile? pickedFile = await _picker.pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 75,
+    );
+    if (pickedFile == null) return;
+
+    await Nearby().sendFilePayload(widget.endpointId, pickedFile.path);
+    ChatStorage.addMessage(widget.endpointId,
+        imagePath: pickedFile.path, isMe: true);
   }
 
   @override
@@ -699,8 +732,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         constraints: BoxConstraints(
                             maxWidth: MediaQuery.of(context).size.width * 0.75),
                         margin: const EdgeInsets.symmetric(vertical: 4),
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 14, vertical: 10),
+                        padding: const EdgeInsets.all(8),
                         decoration: BoxDecoration(
                           gradient: msg.isMe
                               ? const LinearGradient(
@@ -718,9 +750,23 @@ class _ChatScreenState extends State<ChatScreen> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.end,
                           children: [
-                            Text(msg.text,
-                                style: const TextStyle(
-                                    color: Colors.white, fontSize: 15)),
+                            if (msg.imagePath != null)
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(12),
+                                child: Image.file(
+                                  File(msg.imagePath!),
+                                  width: 220,
+                                  fit: BoxFit.cover,
+                                ),
+                              ),
+                            if (msg.text != null)
+                              Padding(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 6, vertical: 2),
+                                child: Text(msg.text!,
+                                    style: const TextStyle(
+                                        color: Colors.white, fontSize: 15)),
+                              ),
                             const SizedBox(height: 4),
                             Row(
                               mainAxisSize: MainAxisSize.min,
@@ -749,6 +795,12 @@ class _ChatScreenState extends State<ChatScreen> {
             color: const Color(0xFF0F172A),
             child: Row(
               children: [
+                IconButton(
+                  icon: const Icon(Icons.photo_library_rounded,
+                      color: Color(0xFF00E5FF), size: 26),
+                  onPressed: _pickAndSendImage,
+                  tooltip: "Send Image from Gallery",
+                ),
                 Expanded(
                   child: TextField(
                     controller: _msgController,

@@ -1,0 +1,31 @@
+name: Build Pi-Bluetooth Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'windows_main.dart'
+      - 'windows_pubspec.yaml'
+      - '.github/workflows/build-windows.yml'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+      - name: Build Windows App
+        run: |
+          flutter create . --project-name pi_bluetooth --platforms=windows
+          copy windows_pubspec.yaml pubspec.yaml
+          copy windows_main.dart lib\main.dart
+          flutter config --enable-windows-desktop
+          flutter pub get
+          flutter build windows --release
+      - name: Upload Windows EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-bluetooth-windows
+          path: build/windows/x64/runner/Release/
